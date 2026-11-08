@@ -13,6 +13,7 @@ running, the time it expires (``deadline``), so a UI can show a countdown. Phase
 - ``encoder``: FFmpeg starting
 - ``subscribing``: waiting before sending LOAD (lets FFmpeg write the first segments)
 - ``quitting_app``: quitting another receiver app before LOAD
+- ``busy``: another app plays on the Chromecast; waiting for it to end (``--takeover idle``)
 - ``loading``: LOAD sent, waiting for the Chromecast to play
 - ``playing`` / ``paused`` / ``idle``: Chromecast player state while streaming
 - ``buffering``: Chromecast buffering; the deadline is the watchdog restart
@@ -44,6 +45,7 @@ _STREAMING_PHASES = frozenset(
         "encoder",
         "subscribing",
         "quitting_app",
+        "busy",
         "loading",
         "playing",
         "paused",
@@ -66,6 +68,7 @@ class _Device:
     player_state: str | None = None
     check_deadline: float | None = None
     buffering_timer: asyncio.TimerHandle | None = None
+    busy_with: str | None = None  # running status of another app on the device
     buffering_at: deque[float] = field(default_factory=lambda: deque(maxlen=100))
 
     def to_dict(self, sink_name: str, now: float) -> dict[str, Any]:
@@ -81,6 +84,7 @@ class _Device:
             "player_state": self.player_state,
             "checking_until": self.check_deadline,
             "buffering_last_minute": len(self.buffering_at),
+            "busy_with": self.busy_with,
         }
 
 
@@ -93,6 +97,7 @@ class StatusTracker:
         self._push_scheduled = False
         self.local_ip: str | None = None
         self.port: int | None = None
+        self.takeover = "always"  # --takeover: "idle" waits for another app to end
         self.active_sink: str | None = None
         self.source_app: str | None = None
         self.stream_started_at: float | None = None
@@ -142,6 +147,14 @@ class StatusTracker:
             self._set_active(sink_name)
         self._changed()
 
+    def set_busy(self, sink_name: str, running: str | None) -> None:
+        """Another app plays on the device (its running status text), or None."""
+        device = self._devices.get(sink_name)
+        if device is None or device.busy_with == running:
+            return
+        device.busy_with = running
+        self._changed()
+
     def phase_of(self, sink_name: str) -> str | None:
         device = self._devices.get(sink_name)
         return device.phase if device else None
@@ -187,9 +200,12 @@ class StatusTracker:
         if (
             phase is None
             # A restart or a deferred deactivation is pending: that is what the user waits for.
-            or device.phase in {"restarting", "lingering", "ready", "unavailable"}
+            or device.phase in {"restarting", "lingering", "ready", "unavailable", "busy"}
             # While loading, IDLE only means "nothing loaded yet".
-            or (phase == "idle" and device.phase in {"connecting", "encoder", "subscribing", "quitting_app", "loading"})
+            or (
+                phase == "idle"
+                and device.phase in {"connecting", "encoder", "subscribing", "quitting_app", "busy", "loading"}
+            )
         ):
             self._changed()
             return
@@ -281,6 +297,7 @@ class StatusTracker:
             "started_at": self.started_at,
             "local_ip": self.local_ip,
             "port": self.port,
+            "takeover": self.takeover,
             "stream": {
                 "sink_name": self.active_sink,
                 "source_app": self.source_app,

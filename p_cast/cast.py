@@ -13,10 +13,17 @@ from pychromecast.controllers.media import (
     MediaController,
 )
 from pychromecast.discovery import CastBrowser, SimpleCastListener
+from pychromecast.models import MDNSServiceInfo
 
 from p_cast.config import StreamConfig
 
 logger = logging.getLogger(__name__)
+
+
+# Title of our stream. A Chromecast shows it in its running status ("Casting: <title>"),
+# so it also tells our own session apart from other apps (and from p-cast on another PC).
+STREAM_TITLE = f"p-cast stream from {platform.node()}"
+_SERVICE_TYPE = "_googlecast._tcp.local."
 
 
 class CastDiscovery:
@@ -100,6 +107,24 @@ class CastDiscovery:
             return None
         return (cast_info.host, cast_info.port)
 
+    def running_status(self, device_id: UUID) -> str | None:
+        """What the device is doing, from its mDNS record (TXT ``rs``), e.g. "Spotify" or
+        "Casting: <title>". None when idle or unknown. Reads the zeroconf cache only."""
+        if self._browser is None:
+            return None
+        cast_info = self._browser.devices.get(device_id)
+        if cast_info is None:
+            return None
+        for service in cast_info.services:
+            if not isinstance(service, MDNSServiceInfo):
+                continue
+            info = zeroconf.ServiceInfo(_SERVICE_TYPE, service.name)
+            if not info.load_from_cache(self._zconf):
+                continue
+            text = (info.properties or {}).get(b"rs")
+            return text.decode(errors="replace").strip() or None if text else None
+        return None
+
     def create_chromecast(self, device_id: UUID) -> pychromecast.Chromecast | None:
         """Create a Chromecast object for a dynamically discovered device."""
         if self._browser is None:
@@ -134,7 +159,7 @@ def subscribe_to_stream(
     mc.play_media(
         url,
         content_type=config.content_type,
-        title=f"p-cast stream from {platform.node()}",
+        title=STREAM_TITLE,
         # thumb=album_image_url,
         stream_type=STREAM_TYPE_LIVE,
         media_info={

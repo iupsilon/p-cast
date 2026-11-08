@@ -7,6 +7,7 @@ import os
 import signal
 import socket
 import tempfile
+import time
 import typing
 from collections.abc import AsyncIterator, Callable, Coroutine
 from functools import partial
@@ -34,7 +35,7 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from p_cast.cast import CastDiscovery, get_local_ip, subscribe_to_stream
+from p_cast.cast import STREAM_TITLE, CastDiscovery, get_local_ip, subscribe_to_stream
 from p_cast.config import DEFAULT_SINK_GAIN, MAX_SAMPLE_RATE, StreamConfig
 from p_cast.device import SinkController, SinkInputMonitor
 from p_cast.ffmpeg import create_ffmpeg_stream_command
@@ -67,6 +68,38 @@ _BUFFERING_RECOVER_TIMEOUT = 6  # seconds of sustained BUFFERING before restarti
 # (Wi-Fi hiccup, the PC resuming from suspend), so without retries it stays unavailable
 # until its record expires.
 _RECONNECT_DELAYS = (5, 10, 20, 30, 60)
+_BUSY_POLL = 2.0  # seconds between checks while waiting for another app to end
+_TAKEOVER_WINDOW = 30.0  # seconds a takeover request from a UI stays valid
+
+# Takeover requests from a UI (POST /devices/{sink}/takeover): sink name -> expiry (monotonic).
+_takeover_requests: dict[str, float] = {}
+
+
+def _takeover_requested(sink_name: str) -> bool:
+    deadline = _takeover_requests.get(sink_name)
+    return deadline is not None and time.monotonic() < deadline
+
+
+def _busy_with(cast: Chromecast) -> str | None:
+    """What another app plays on a connected Chromecast, or None if it is free.
+
+    Our own session (from an earlier activation) does not count, nor does an idle
+    default media receiver.
+    """
+    app_id = cast.app_id
+    if app_id in (None, APP_BACKDROP):
+        return None
+    text = (cast.status.status_text if cast.status is not None else "") or ""
+    if STREAM_TITLE in text:
+        return None
+    if app_id == APP_MEDIA_RECEIVER:
+        media = cast.media_controller.status
+        if media is None or media.player_state not in {"PLAYING", "BUFFERING", "PAUSED"}:
+            return None
+    elif not text:
+        # An app with nothing to show (e.g. the follower app of a speaker group member).
+        return None
+    return text or cast.app_display_name or app_id
 
 
 def _normalize_host(host: str) -> str:
@@ -330,11 +363,13 @@ async def lifespan(  # noqa: C901, PLR0915
     discovery: CastDiscovery,
     streaming_port: int,
     sink_gain: float = DEFAULT_SINK_GAIN,
+    takeover: str = "always",
 ) -> AsyncIterator[None]:
     for controller in controllers.values():
         await controller.init()
         tracker.add_device(controller.sink_name, controller.cast.name)
     tracker.port = streaming_port
+    tracker.takeover = takeover
     tracker.event("info", "started", f"p-cast started, {len(controllers)} device(s) found", count=len(controllers))
 
     active_stream: ActiveStream | None = None
@@ -490,6 +525,27 @@ async def lifespan(  # noqa: C901, PLR0915
             async def subscribe() -> None:
                 await asyncio.sleep(_STREAM_SUBSCRIBE_DELAY)
                 try:
+                    busy = _busy_with(cast)
+                    if busy and takeover == "idle" and not _takeover_requested(sink_name):
+                        logger.info("%s is busy (%s), waiting for it to end", sink_name, busy)
+                        tracker.set_phase(sink_name, "busy", reason=busy)
+                        tracker.event(
+                            "warning",
+                            "busy",
+                            f"{busy} is playing on the Chromecast, waiting for it to end",
+                            sink_name,
+                            app=busy,
+                        )
+                        # The cast status changes on pychromecast's socket thread: poll it.
+                        while _busy_with(cast) and not _takeover_requested(sink_name):  # noqa: ASYNC110
+                            await asyncio.sleep(_BUSY_POLL)
+                        tracker.event("info", "busy_over", "The Chromecast is free, starting", sink_name)
+                    elif busy and cast.app_id == APP_MEDIA_RECEIVER:
+                        # LOAD replaces the session of the other sender.
+                        tracker.event(
+                            "warning", "took_over", f"Replacing {busy} on the Chromecast", sink_name, app=busy
+                        )
+                    _takeover_requests.pop(sink_name, None)
                     # A device that is still running another receiver app (e.g. the follower
                     # app it runs while part of a speaker group) rejects LOAD with
                     # INVALID_REQUEST. Quit it first so the default media receiver is launched.
@@ -507,7 +563,7 @@ async def lifespan(  # noqa: C901, PLR0915
                         tracker.set_phase(sink_name, "quitting_app", timeout=_APP_QUIT_DELAY)
                         await asyncio.sleep(_APP_QUIT_DELAY)
                     subscribe_to_stream(cast.media_controller, local_ip, streaming_port, stream_config)
-                    if tracker.phase_of(sink_name) in {"subscribing", "quitting_app"}:
+                    if tracker.phase_of(sink_name) in {"subscribing", "quitting_app", "busy"}:
                         tracker.set_phase(sink_name, "loading")
                     tracker.event("info", "loading", "Stream sent to the Chromecast", sink_name)
                 except Exception as exc:
@@ -789,11 +845,25 @@ async def lifespan(  # noqa: C901, PLR0915
                 await mark_device_unavailable(sink_name, controller, "removed from mDNS")
                 return
 
+    def update_busy(device_id: UUID) -> None:
+        """Show what another app plays on the device, from its mDNS record."""
+        controller = get_controller(device_id)
+        if controller is None:
+            return
+        running = discovery.running_status(device_id)
+        tracker.set_busy(controller.sink_name, None if running is None or STREAM_TITLE in running else running)
+
+    def on_mdns_update(device_id: UUID) -> None:
+        loop.call_soon_threadsafe(update_busy, device_id)
+        spawn_threadsafe(loop, handle_device_add(device_id))
+
     discovery.set_callbacks(
-        on_add=lambda uuid: spawn_threadsafe(loop, handle_device_add(uuid)),
+        on_add=on_mdns_update,
         on_remove=lambda uuid: spawn_threadsafe(loop, handle_device_remove(uuid)),
-        on_update=lambda uuid: spawn_threadsafe(loop, handle_device_add(uuid)),
+        on_update=on_mdns_update,
     )
+    for controller in controllers.values():
+        update_busy(controller.device_id)
 
     app.state.controllers = controllers
     app.state.monitor = monitor
@@ -883,6 +953,23 @@ async def devices(request: Request) -> Response:
     return JSONResponse(device_list)
 
 
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+async def takeover(request: Request) -> Response:
+    """Let the next activation of a sink stop another app on the Chromecast
+    (``--takeover idle``). Only from this computer: the port is open to the network."""
+    client = request.client.host if request.client else None
+    if client not in _LOOPBACK:
+        return JSONResponse({"error": "only allowed from this computer"}, status_code=403)
+    sink_name = request.path_params["sink_name"]
+    if sink_name not in request.app.state.controllers:
+        return JSONResponse({"error": f"unknown sink {sink_name}"}, status_code=404)
+    _takeover_requests[sink_name] = time.monotonic() + _TAKEOVER_WINDOW
+    logger.info("Takeover requested for %s", sink_name)
+    return JSONResponse({"sink_name": sink_name, "valid_for": _TAKEOVER_WINDOW}, status_code=202)
+
+
 async def status_snapshot(request: Request) -> Response:  # noqa: ARG001
     return JSONResponse(tracker.snapshot())
 
@@ -943,6 +1030,7 @@ def create_app() -> Starlette:
 
     streaming_port = int(os.environ["PCAST_PORT"])
     sink_gain = float(os.environ.get("PCAST_SINK_GAIN", DEFAULT_SINK_GAIN))
+    takeover_mode = os.environ.get("PCAST_TAKEOVER", "always")
     stream_config = StreamConfig(
         acodec="aac",
         bitrate=os.environ["PCAST_BITRATE"],
@@ -978,6 +1066,7 @@ def create_app() -> Starlette:
             Route("/play", endpoint=play),
             Route("/devices", endpoint=devices),
             Route("/status", endpoint=status_snapshot),
+            Route("/devices/{sink_name}/takeover", endpoint=takeover, methods=["POST"]),
             WebSocketRoute("/events", endpoint=status_events),
         ],
         lifespan=partial(
@@ -987,6 +1076,7 @@ def create_app() -> Starlette:
             discovery=discovery,
             streaming_port=streaming_port,
             sink_gain=sink_gain,
+            takeover=takeover_mode,
         ),
         middleware=middleware,
     )

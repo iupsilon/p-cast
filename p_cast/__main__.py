@@ -105,6 +105,13 @@ def main() -> None:
         metavar="GAIN",
         help=f"fixed linear gain applied by the virtual sinks; 1.0 is unity (default: {DEFAULT_SINK_GAIN})",
     )
+    parser.add_argument(
+        "--takeover",
+        choices=["always", "idle"],
+        default="always",
+        help="when another app plays on the Chromecast: 'always' stops it, 'idle' waits until it ends "
+        "(a UI can still take over) (default: always)",
+    )
     args = parser.parse_args()
 
     if not bitrate_ok(args.bitrate):
@@ -135,6 +142,7 @@ def main() -> None:
     os.environ["PCAST_FFMPEG"] = args.ffmpeg
     os.environ["PCAST_LOG_LEVEL"] = args.log_level
     os.environ["PCAST_SINK_GAIN"] = str(args.sink_gain)
+    os.environ["PCAST_TAKEOVER"] = args.takeover
     if args.log_file != "console":
         os.environ["PCAST_LOG_FILE"] = args.log_file
 
