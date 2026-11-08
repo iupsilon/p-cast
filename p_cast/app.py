@@ -80,6 +80,10 @@ def _takeover_requested(sink_name: str) -> bool:
     return deadline is not None and time.monotonic() < deadline
 
 
+# Running status (mDNS "rs") of the default media receiver when it shows no title.
+_MEDIA_RECEIVER_NAME = "Default Media Receiver"
+
+
 def _busy_with(cast: Chromecast) -> str | None:
     """What another app plays on a connected Chromecast, or None if it is free.
 
@@ -851,7 +855,11 @@ async def lifespan(  # noqa: C901, PLR0915
         if controller is None:
             return
         running = discovery.running_status(device_id)
-        tracker.set_busy(controller.sink_name, None if running is None or STREAM_TITLE in running else running)
+        if running is None or STREAM_TITLE in running or running == _MEDIA_RECEIVER_NAME:
+            # The default media receiver shows only its name both when it is left open with
+            # nothing loaded and while it plays our stream: not a reason to warn.
+            running = None
+        tracker.set_busy(controller.sink_name, running)
 
     def on_mdns_update(device_id: UUID) -> None:
         loop.call_soon_threadsafe(update_busy, device_id)
