@@ -36,6 +36,7 @@ __all__ = ["StatusTracker", "status"]
 _EVENT_LOG_SIZE = 50
 _BUFFERING_WINDOW = 60.0  # seconds counted by "buffering_last_minute"
 _SUBSCRIBER_QUEUE_SIZE = 100
+_FETCH_STALL_AFTER = 4.0  # seconds without a segment fetch before "fetch_stalled"
 # A Chromecast playing at the live edge reports BUFFERING for a fraction of a second between
 # segments while the audio keeps playing. Only BUFFERING that lasts longer is shown.
 _BUFFERING_GRACE = 2.0
@@ -103,6 +104,8 @@ class StatusTracker:
         self.stream_started_at: float | None = None
         self.last_playlist_at: float | None = None
         self.last_segment_at: float | None = None
+        self.fetch_stalled = False
+        self._stall_timer: asyncio.TimerHandle | None = None
 
     # -- devices ---------------------------------------------------------------
 
@@ -257,6 +260,10 @@ class StatusTracker:
         self.stream_started_at = time.time() if sink_name else None
         self.last_playlist_at = None
         self.last_segment_at = None
+        self._set_stalled(False)
+        if self._stall_timer is not None:
+            self._stall_timer.cancel()
+            self._stall_timer = None
         if sink_name is None:
             self.source_app = None
 
@@ -267,8 +274,24 @@ class StatusTracker:
             self.last_playlist_at = now
         else:
             self.last_segment_at = now
-        # Not pushed: a UI computes the age from the snapshot it gets on the next change
-        # or polls /status. Pushing every segment would wake it every second.
+            self._arm_stall_timer()
+        # The timestamps are not pushed: that would wake every UI each second. A UI
+        # learns of a stall from fetch_stalled, pushed only when it flips.
+
+    def _arm_stall_timer(self) -> None:
+        self._set_stalled(False)
+        if self._stall_timer is not None:
+            self._stall_timer.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._stall_timer = loop.call_later(_FETCH_STALL_AFTER, self._set_stalled, True)
+
+    def _set_stalled(self, stalled: bool) -> None:
+        if stalled != self.fetch_stalled:
+            self.fetch_stalled = stalled
+            self._changed()
 
     # -- events ----------------------------------------------------------------
 
@@ -304,6 +327,7 @@ class StatusTracker:
                 "started_at": self.stream_started_at,
                 "last_playlist_at": self.last_playlist_at,
                 "last_segment_at": self.last_segment_at,
+                "fetch_stalled": self.fetch_stalled,
             },
             "devices": [d.to_dict(name, now) for name, d in sorted(self._devices.items())],
             "events": list(self._events),
