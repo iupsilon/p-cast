@@ -30,7 +30,10 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 __all__ = ["StatusTracker", "status"]
 
@@ -44,7 +47,9 @@ _FETCH_STALL_AFTER = 4.0  # seconds without a segment fetch before "fetch_stalle
 # segments while the audio keeps playing. Only BUFFERING that lasts longer is shown.
 _BUFFERING_GRACE = 2.0
 # Spells (longer than the grace) within _BUFFERING_WINDOW that make a buffering loop.
-_BUFFERING_LOOP_COUNT = 8
+_BUFFERING_LOOP_COUNT = 5
+# A loop again this soon after resetting the Chromecast's player: only a power cycle helps.
+_BUFFERING_LOOP_RECUR = 300.0
 _STREAMING_PHASES = frozenset(
     {
         "connecting",
@@ -76,6 +81,7 @@ class _Device:
     buffering_timer: asyncio.TimerHandle | None = None
     busy_with: str | None = None  # running status of another app on the device
     in_buffering_loop: bool = False
+    player_reset_at: float | None = None  # when p-cast last reset the receiver for a loop
     buffering_at: deque[float] = field(default_factory=lambda: deque(maxlen=100))
 
     def to_dict(self, sink_name: str, now: float) -> dict[str, Any]:
@@ -112,6 +118,8 @@ class StatusTracker:
         self.last_segment_at: float | None = None
         self.fetch_stalled = False
         self._stall_timer: asyncio.TimerHandle | None = None
+        # Set by the app: reset the receiver of a device stuck in a buffering loop.
+        self.on_buffering_loop: Callable[[str], object] | None = None
 
     # -- devices ---------------------------------------------------------------
 
@@ -170,12 +178,29 @@ class StatusTracker:
             device.in_buffering_loop = False
         elif count >= _BUFFERING_LOOP_COUNT and not device.in_buffering_loop:
             device.in_buffering_loop = True
+            recurred = device.player_reset_at is not None and now - device.player_reset_at < _BUFFERING_LOOP_RECUR
+            if self.on_buffering_loop is not None and not recurred:
+                # The receiver app on the device gets stuck; closing it and loading the
+                # stream on a fresh one has cleared the loop.
+                logger.warning(
+                    "Buffering loop on %s: buffered %d times in %ds while segments are served; "
+                    "resetting the Chromecast's player",
+                    sink_name,
+                    count,
+                    int(_BUFFERING_WINDOW),
+                )
+                device.player_reset_at = now
+                device.buffering_at.clear()
+                device.in_buffering_loop = False
+                self.event("warning", "player_reset", "The Chromecast kept buffering, restarting its player", sink_name)
+                self.on_buffering_loop(sink_name)
+                return
             logger.warning(
-                "Buffering loop on %s: buffered %d times in %ds while segments are served; "
-                "the Chromecast seems stuck (a power cycle has fixed it before)",
+                "Buffering loop on %s: buffered %d times in %ds%s; the Chromecast needs a power cycle",
                 sink_name,
                 count,
                 int(_BUFFERING_WINDOW),
+                " right after a player reset" if recurred else "",
             )
             self.event(
                 "warning",

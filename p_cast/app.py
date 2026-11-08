@@ -61,6 +61,7 @@ def _sd_notify(state: str) -> None:
 _FFMPEG_STARTUP_DELAY = 0.5
 _STREAM_SUBSCRIBE_DELAY = 2
 _APP_QUIT_DELAY = 1.0
+_MDNS_REMOVE_GRACE = 10.0  # seconds a device must stay out of mDNS before it is removed
 _FFMPEG_RESTART_DELAY = 2  # seconds to wait before restarting a stream whose FFmpeg exited
 _BUFFERING_RECOVER_TIMEOUT = 6  # seconds of sustained BUFFERING before restarting stream (6 is minimum)
 # Seconds between reconnection attempts to a device whose connection was lost; the last
@@ -724,6 +725,22 @@ async def lifespan(  # noqa: C901, PLR0915
             await _deactivate(sink_name, next_phase="restarting")
             await _activate(sink_name)
 
+    async def reset_player(sink_name: str) -> None:
+        """Close the receiver app on the Chromecast and load the stream on a fresh one."""
+        async with activation_lock:
+            if monitor.active_sink != sink_name or active_stream is None or active_stream.sink_name != sink_name:
+                return
+            cast = controllers[sink_name].cast
+            # Quit before the teardown, which drops the connection.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.to_thread(cast.quit_app), timeout=5.0)
+            await _deactivate(sink_name, next_phase="restarting")
+            await asyncio.sleep(_APP_QUIT_DELAY)
+            if monitor.active_sink == sink_name:
+                await _activate(sink_name)
+
+    tracker.on_buffering_loop = lambda sink_name: spawn(reset_player(sink_name))
+
     monitor = SinkInputMonitor(
         controllers=controllers,
         on_activate=on_activate,
@@ -881,11 +898,36 @@ async def lifespan(  # noqa: C901, PLR0915
         finally:
             _reconnect_tasks.pop(controller.device_id, None)
 
+    # A Chromecast withdraws its mDNS record for about a second when its receiver app
+    # changes (e.g. quitting the media receiver) and on brief network hiccups. Removing
+    # the sink at once moves the audio away and stops the playing app, so a removal only
+    # counts if the device stays away and does not answer either.
+    pending_removals: dict[UUID, asyncio.Task[None]] = {}
+
     async def handle_device_remove(device_id: UUID) -> None:
-        for sink_name, controller in controllers.items():
-            if controller.device_id == device_id:
-                await mark_device_unavailable(sink_name, controller, "removed from mDNS")
-                return
+        if device_id in pending_removals:
+            return
+        pending_removals[device_id] = spawn(_confirm_removal(device_id))
+
+    async def _confirm_removal(device_id: UUID) -> None:
+        try:
+            await asyncio.sleep(_MDNS_REMOVE_GRACE)
+        except asyncio.CancelledError:
+            return
+        pending_removals.pop(device_id, None)
+        controller = get_controller(device_id)
+        if controller is None or not controller.available:
+            return
+        info = controller.cast.cast_info
+        if await _tcp_probe(info.host, info.port):
+            logger.info("%s left mDNS but still answers, keeping it", controller.sink_name)
+            return
+        await mark_device_unavailable(controller.sink_name, controller, "removed from mDNS")
+
+    def cancel_pending_removal(device_id: UUID) -> None:
+        task = pending_removals.pop(device_id, None)
+        if task is not None:
+            task.cancel()
 
     def update_busy(device_id: UUID) -> None:
         """Show what another app plays on the device, from its mDNS record."""
@@ -900,6 +942,7 @@ async def lifespan(  # noqa: C901, PLR0915
         tracker.set_busy(controller.sink_name, running)
 
     def on_mdns_update(device_id: UUID) -> None:
+        loop.call_soon_threadsafe(cancel_pending_removal, device_id)
         loop.call_soon_threadsafe(update_busy, device_id)
         spawn_threadsafe(loop, handle_device_add(device_id))
 
