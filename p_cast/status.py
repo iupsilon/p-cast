@@ -260,7 +260,7 @@ class StatusTracker:
         self.stream_started_at = time.time() if sink_name else None
         self.last_playlist_at = None
         self.last_segment_at = None
-        self._set_stalled(False)
+        self._clear_stalled()
         if self._stall_timer is not None:
             self._stall_timer.cancel()
             self._stall_timer = None
@@ -279,18 +279,23 @@ class StatusTracker:
         # learns of a stall from fetch_stalled, pushed only when it flips.
 
     def _arm_stall_timer(self) -> None:
-        self._set_stalled(False)
+        self._clear_stalled()
         if self._stall_timer is not None:
             self._stall_timer.cancel()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._stall_timer = loop.call_later(_FETCH_STALL_AFTER, self._set_stalled, True)
+        self._stall_timer = loop.call_later(_FETCH_STALL_AFTER, self._mark_stalled)
 
-    def _set_stalled(self, stalled: bool) -> None:
-        if stalled != self.fetch_stalled:
-            self.fetch_stalled = stalled
+    def _mark_stalled(self) -> None:
+        if not self.fetch_stalled:
+            self.fetch_stalled = True
+            self._changed()
+
+    def _clear_stalled(self) -> None:
+        if self.fetch_stalled:
+            self.fetch_stalled = False
             self._changed()
 
     # -- events ----------------------------------------------------------------

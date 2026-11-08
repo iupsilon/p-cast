@@ -328,6 +328,7 @@ class ActiveStream:
         volume_controller: SinkController,
         connection_listener: CastConnectionListener,
         buffering_watchdog: BufferingWatchdog,
+        stopping: asyncio.Event,
     ) -> None:
         self.sink_name = sink_name
         self.ffmpeg_process = ffmpeg_process
@@ -338,20 +339,25 @@ class ActiveStream:
         self.volume_controller = volume_controller
         self.connection_listener = connection_listener
         self.buffering_watchdog = buffering_watchdog
+        self.stopping = stopping
 
     async def teardown(self) -> None:
+        self.stopping.set()
         self.connection_listener.deactivate()
         self.buffering_watchdog.cancel()
         self.subscribe_task.cancel()
-        # The watcher itself may be tearing the stream down (restart after FFmpeg exited).
-        if self.ffmpeg_watcher is not asyncio.current_task():
-            self.ffmpeg_watcher.cancel()
         with contextlib.suppress(Exception):
             # tell it to stop, but don't quit() the CC app (and trigger a disconnect)
             await asyncio.to_thread(self.volume_controller.cast.media_controller.stop, timeout=1.0)
         if self.ffmpeg_process.returncode is None:
             self.ffmpeg_process.terminate()
             await self.ffmpeg_process.wait()
+        # Cancel the watcher only now that FFmpeg has exited: cancelling it while it awaits
+        # process.wait() makes uvloop log InvalidStateError when the exit arrives. It returns
+        # by itself (stopping is set); the watcher may also be the task tearing down.
+        if self.ffmpeg_watcher is not asyncio.current_task():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(self.ffmpeg_watcher, timeout=2.0)
         try:
             await self.volume_controller.stop_volume_sync()
         except Exception:
@@ -395,10 +401,10 @@ async def lifespan(  # noqa: C901, PLR0915
             controller.cast.disconnect(timeout=0.0)
         await controller.remove_sink()
         await monitor.refresh_sink_indices()
-        monitor.clear_active()
+        monitor.clear_active(sink_name)
         schedule_reconnect(controller, "connection lost")
 
-    async def _activate(sink_name: str) -> None:  # noqa: PLR0915, C901
+    async def _activate(sink_name: str) -> None:  # noqa: PLR0912, PLR0915, C901
         nonlocal active_stream
         nonlocal local_ip
 
@@ -408,7 +414,7 @@ async def lifespan(  # noqa: C901, PLR0915
             tracker.event("warning", "skip_unavailable", "Audio sent to a device that is not available", sink_name)
             # Let the monitor retry on the next sink-input event instead of
             # believing this sink is streaming.
-            monitor.clear_active()
+            monitor.clear_active(sink_name)
             return
 
         # Resolve on every activation: a laptop may have moved to another network
@@ -433,14 +439,21 @@ async def lifespan(  # noqa: C901, PLR0915
             controller.available = False
             await controller.remove_sink()
             await monitor.refresh_sink_indices()
-            monitor.clear_active()
+            monitor.clear_active(sink_name)
             return
         controller.cast = cast
         tracker.set_phase(sink_name, "connecting", timeout=CAST_CONNECT_TIMEOUT)
         tracker.event("info", "connecting", "Connecting to the Chromecast", sink_name)
-        with contextlib.suppress(RequestTimeout):
-            await asyncio.to_thread(cast.wait, timeout=CAST_CONNECT_TIMEOUT)
-            # (cast.status will be None upon timeout)
+        try:
+            with contextlib.suppress(RequestTimeout):
+                await asyncio.to_thread(cast.wait, timeout=CAST_CONNECT_TIMEOUT)
+                # (cast.status will be None upon timeout)
+        except asyncio.CancelledError:
+            # Superseded by another output while connecting.
+            with contextlib.suppress(Exception):
+                cast.disconnect(timeout=0.0)
+            tracker.set_phase(sink_name, "ready", reason="cancelled")
+            raise
 
         if cast.status is None:
             logger.warning(
@@ -461,11 +474,12 @@ async def lifespan(  # noqa: C901, PLR0915
                 cast.disconnect(timeout=0.0)
             await controller.remove_sink()
             await monitor.refresh_sink_indices()
-            monitor.clear_active()
+            monitor.clear_active(sink_name)
             schedule_reconnect(controller, "not reachable")
             return
 
         stream_dir = tempfile.TemporaryDirectory()
+        stream_stopping = asyncio.Event()  # set by the teardown: FFmpeg exiting then is expected
         ffmpeg_process: asyncio.subprocess.Process | None = None
         subscribe_task: asyncio.Task[None] | None = None
         ffmpeg_watcher: asyncio.Task[None] | None = None
@@ -517,6 +531,7 @@ async def lifespan(  # noqa: C901, PLR0915
 
             logger.debug("Publishing audio stream for chromecast")
             stream_app = StaticFilesWithCORS(StaticFiles(directory=stream_dir.name))
+            _unmount_stream()  # a failed activation may have left one: the first mount wins
             app.mount("/stream", stream_app)
 
             buffering_watchdog = BufferingWatchdog(
@@ -594,7 +609,7 @@ async def lifespan(  # noqa: C901, PLR0915
                     async for line in process.stderr:
                         logger.warning("FFmpeg (%s): %s", sink_name, line.decode(errors="replace").rstrip())
                 returncode = await process.wait()
-                if _shutting_down:
+                if _shutting_down or stream_stopping.is_set():
                     return
                 logger.error("FFmpeg exited unexpectedly (code %d) for %s, restarting stream", returncode, sink_name)
                 tracker.set_phase(sink_name, "restarting", timeout=_FFMPEG_RESTART_DELAY, reason="encoder exited")
@@ -622,23 +637,39 @@ async def lifespan(  # noqa: C901, PLR0915
                 volume_controller=controller,
                 connection_listener=connection_listener,
                 buffering_watchdog=buffering_watchdog,
+                stopping=stream_stopping,
             )
 
             app.state.active_controller = controller
 
-        except Exception:
-            logger.exception("Failed to activate stream for sink: %s", sink_name)
-            tracker.set_phase(sink_name, "ready", reason="activation failed")
-            tracker.event("error", "activation_failed", "Could not start the stream", sink_name)
-            monitor.clear_active()
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                logger.info("Activation of %s cancelled, cleaning up", sink_name)
+                tracker.set_phase(sink_name, "ready", reason="cancelled")
+            elif isinstance(exc, Exception):
+                logger.exception("Failed to activate stream for sink: %s", sink_name)
+                tracker.set_phase(sink_name, "ready", reason="activation failed")
+                tracker.event("error", "activation_failed", "Could not start the stream", sink_name)
+                monitor.clear_active(sink_name)
+            stream_stopping.set()
             if subscribe_task is not None:
                 subscribe_task.cancel()
-            if ffmpeg_watcher is not None:
-                ffmpeg_watcher.cancel()
             if ffmpeg_process is not None and ffmpeg_process.returncode is None:
                 ffmpeg_process.terminate()
                 await ffmpeg_process.wait()
+            if ffmpeg_watcher is not None:
+                ffmpeg_watcher.cancel()
+            _unmount_stream()
+            with contextlib.suppress(Exception):
+                await controller.stop_volume_sync()
+            with contextlib.suppress(Exception):
+                cast.disconnect(timeout=0.0)
             stream_dir.cleanup()
+            if not isinstance(exc, Exception):
+                raise
+
+    def _unmount_stream() -> None:
+        app.routes[:] = [r for r in app.routes if not (hasattr(r, "path") and r.path == "/stream")]
 
     async def _deactivate(sink_name: str, next_phase: str = "ready") -> None:
         nonlocal active_stream
@@ -649,7 +680,7 @@ async def lifespan(  # noqa: C901, PLR0915
         if active_stream is not None:
             logger.info("Deactivating cast from sink: %s", sink_name)
             await active_stream.teardown()
-            app.routes[:] = [r for r in app.routes if not (hasattr(r, "path") and r.path == "/stream")]
+            _unmount_stream()
             active_stream = None
             app.state.active_controller = None
             with contextlib.suppress(TimeoutError):
@@ -691,6 +722,7 @@ async def lifespan(  # noqa: C901, PLR0915
         controllers=controllers,
         on_activate=on_activate,
         on_deactivate=on_deactivate,
+        on_crash=lambda: spawn(_shutdown(1)),
     )
     await monitor.start()
 
@@ -700,7 +732,7 @@ async def lifespan(  # noqa: C901, PLR0915
             return
         if active_stream is not None and monitor.active_sink == sink_name:
             await on_deactivate(sink_name)
-            monitor.clear_active()
+            monitor.clear_active(sink_name)
         controller.available = False
         with contextlib.suppress(RuntimeError, TimeoutError):  # expect timeout; ok if cast is unset
             controller.cast.disconnect(timeout=0.0)
@@ -880,11 +912,18 @@ async def lifespan(  # noqa: C901, PLR0915
     _shutting_down = False
 
     async def _sigterm_handler() -> None:
+        await _shutdown(0)
+
+    async def _shutdown(exit_code: int) -> None:
+        """Clean up and exit; a non-zero code makes systemd (Restart=on-failure) restart us."""
         nonlocal active_stream, _shutting_down
         if _shutting_down:
             return
         _shutting_down = True
-        logger.info("SIGTERM received, running cleanup")
+        if exit_code:
+            logger.error("Unrecoverable error, cleaning up and exiting to be restarted")
+        else:
+            logger.info("SIGTERM received, running cleanup")
         # Claim active_stream so the post-yield path skips it if both paths run.
         _stream, active_stream = active_stream, None
         with contextlib.suppress(Exception):
@@ -897,7 +936,7 @@ async def lifespan(  # noqa: C901, PLR0915
                 await asyncio.wait_for(ctrl.close(), timeout=3.0)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(asyncio.to_thread(discovery.stop), timeout=3.0)
-        os._exit(0)
+        os._exit(exit_code)
 
     # Granian's Rust/Tokio layer seems to block SIGTERM process-wide for signalfd use.
     # Unblocking it in the event-loop thread and registering an asyncio handler

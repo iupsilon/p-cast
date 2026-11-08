@@ -318,8 +318,10 @@ class SinkInputMonitor:
         controllers: dict[str, SinkController],
         on_activate: ActivationCallback,
         on_deactivate: DeactivationCallback,
+        on_crash: Callable[[], object] | None = None,
     ) -> None:
         self._controllers = controllers
+        self._on_crash = on_crash
         self._on_activate = on_activate
         self._on_deactivate = on_deactivate
         self._active_sink: str | None = None
@@ -327,22 +329,31 @@ class SinkInputMonitor:
         self._sink_indices: dict[int, str] = {}
         self._our_sink_indices: set[int] = set()
         self._deactivation_task: asyncio.Task[None] | None = None
+        # The sink the app currently streams to (or is starting): what the worker applied.
+        self._applied: str | None = None
+        self._wake = asyncio.Event()
+        self._worker: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         self._pulse = pulsectl_asyncio.PulseAsync("p-cast-monitor")
         await self._pulse.connect()
         self._query_pulse = pulsectl_asyncio.PulseAsync("p-cast-monitor-query")
         await self._query_pulse.connect()
+        self._worker = asyncio.create_task(self._apply_loop())
+        self._worker.add_done_callback(self._on_monitor_done)
         self._task = asyncio.create_task(self._monitor())
         self._task.add_done_callback(self._on_monitor_done)
 
-    @staticmethod
-    def _on_monitor_done(task: asyncio.Task[None]) -> None:
+    def _on_monitor_done(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
             return
         exc = task.exception()
         if exc is not None:
+            # e.g. PulseDisconnected after a PipeWire restart: our sinks are gone too, and
+            # nothing would notice audio routed to them again. Let the app restart.
             logger.error("Sink-input monitor crashed: %s", exc, exc_info=exc)
+            if self._on_crash is not None:
+                self._on_crash()
 
     def _cancel_deferred_deactivation(self) -> None:
         if self._deactivation_task is not None:
@@ -351,8 +362,57 @@ class SinkInputMonitor:
             if self._active_sink is not None:
                 tracker.restore_player_phase(self._active_sink)
 
+    # -- applying the target ---------------------------------------------------
+    #
+    # The event handlers only decide which sink should stream (self._active_sink) and wake
+    # the worker. Starting a stream can take seconds (Chromecast connection, FFmpeg), and
+    # sink-input events must not queue behind it: a user who moves the audio elsewhere
+    # meanwhile would wait for an activation that is no longer wanted. The worker applies
+    # the latest target, one step at a time, and cancels an activation that a newer
+    # target supersedes.
+
+    def _request_apply(self) -> None:
+        self._wake.set()
+
+    async def _apply_loop(self) -> None:
+        while True:
+            await self._wake.wait()
+            self._wake.clear()
+            target = self._active_sink
+            if target == self._applied:
+                continue
+            if self._applied is not None:
+                previous, self._applied = self._applied, None
+                await self._on_deactivate(previous)
+            if target is None or target != self._active_sink:
+                # The target changed again while the old stream was stopping.
+                self._wake.set()
+                continue
+            self._applied = target
+            activation = asyncio.create_task(self._on_activate(target))
+            while not activation.done():
+                woken = asyncio.create_task(self._wake.wait())
+                await asyncio.wait({activation, woken}, return_when=asyncio.FIRST_COMPLETED)
+                woken.cancel()
+                if not activation.done() and self._active_sink != target:
+                    logger.info("Activation of %s superseded by %s, cancelling it", target, self._active_sink)
+                    activation.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await activation
+                    self._wake.set()
+                elif not activation.done():
+                    self._wake.clear()  # woken for the same target: keep waiting
+            if not activation.cancelled() and (exc := activation.exception()) is not None:
+                logger.error("Activation of %s failed: %s", target, exc, exc_info=exc)
+            if self._active_sink != target:
+                self._wake.set()
+
     async def stop(self) -> None:
         self._cancel_deferred_deactivation()
+        if self._worker is not None:
+            self._worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._worker
         if hasattr(self, "_task"):
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -391,12 +451,10 @@ class SinkInputMonitor:
                 sink_name = self._sink_indices[sink_idx]
                 self._active_sink_inputs.add(si.index)  # pyright: ignore[reportAttributeAccessIssue]
                 if self._active_sink != sink_name:
-                    if self._active_sink is not None:
-                        await self._on_deactivate(self._active_sink)
                     self._active_sink = sink_name
                     logger.info("Existing sink-input detected on: %s", sink_name)
                     tracker.set_source(_app_name(si))
-                    await self._on_activate(sink_name)
+                    self._request_apply()
 
     async def _monitor(self) -> None:
         await self.refresh_sink_indices()
@@ -450,7 +508,6 @@ class SinkInputMonitor:
                             sink_name,
                             previous=self._active_sink,
                         )
-                        await self._on_deactivate(self._active_sink)
                     self._active_sink = sink_name
                     self._active_sink_inputs.clear()
                     logger.info("Sink activated: %s", sink_name)
@@ -458,19 +515,18 @@ class SinkInputMonitor:
                     tracker.event(
                         "info", "activated", f"Audio from {_app_name(si) or 'an app'}", sink_name, app=_app_name(si)
                     )
-                    await self._on_activate(sink_name)
-                # A failed activation calls clear_active(); don't track the input then,
-                # so the next event for it retries the activation.
-                if self._active_sink == sink_name:
-                    self._active_sink_inputs.add(sink_input_index)
+                    self._request_apply()
+                # A failed activation calls clear_active(), which forgets this input:
+                # the next event for it retries the activation.
+                self._active_sink_inputs.add(sink_input_index)
             elif sink_input_index in self._active_sink_inputs:
                 # Sink-input moved away from our sink to a non-monitored sink
                 self._active_sink_inputs.discard(sink_input_index)
                 if not self._active_sink_inputs and self._active_sink is not None:
                     logger.info("Sink deactivated (moved away): %s", self._active_sink)
                     tracker.event("info", "moved_away", "Audio moved to another output", self._active_sink)
-                    await self._on_deactivate(self._active_sink)
                     self._active_sink = None
+                    self._request_apply()
             break
 
     async def _handle_removed_sink_input(self, sink_input_index: int) -> None:
@@ -501,13 +557,21 @@ class SinkInputMonitor:
             # Clear first, so a new sink-input during the teardown activates the sink again
             # (on_activate waits for the teardown to finish).
             self._active_sink = None
-            await self._on_deactivate(sink_name)
+            self._request_apply()
 
-    def clear_active(self) -> None:
-        """Reset active state so the monitor can re-detect existing sink-inputs."""
+    def clear_active(self, sink_name: str | None = None) -> None:
+        """Reset active state so the monitor can re-detect existing sink-inputs.
+
+        With ``sink_name``, only if that sink is still the target: a failure of an
+        activation the user already moved away from must not drop the newer choice.
+        """
+        if sink_name is not None and self._active_sink not in (None, sink_name):
+            return
         self._cancel_deferred_deactivation()
         self._active_sink = None
         self._active_sink_inputs.clear()
+        if sink_name is not None and self._applied == sink_name:
+            self._applied = None
 
     @property
     def active_sink(self) -> str | None:
