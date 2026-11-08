@@ -26,12 +26,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = ["StatusTracker", "status"]
+
+logger = logging.getLogger(__name__)
 
 _EVENT_LOG_SIZE = 50
 _BUFFERING_WINDOW = 60.0  # seconds counted by "buffering_last_minute"
@@ -40,6 +43,8 @@ _FETCH_STALL_AFTER = 4.0  # seconds without a segment fetch before "fetch_stalle
 # A Chromecast playing at the live edge reports BUFFERING for a fraction of a second between
 # segments while the audio keeps playing. Only BUFFERING that lasts longer is shown.
 _BUFFERING_GRACE = 2.0
+# Spells (longer than the grace) within _BUFFERING_WINDOW that make a buffering loop.
+_BUFFERING_LOOP_COUNT = 8
 _STREAMING_PHASES = frozenset(
     {
         "connecting",
@@ -70,6 +75,7 @@ class _Device:
     check_deadline: float | None = None
     buffering_timer: asyncio.TimerHandle | None = None
     busy_with: str | None = None  # running status of another app on the device
+    in_buffering_loop: bool = False
     buffering_at: deque[float] = field(default_factory=lambda: deque(maxlen=100))
 
     def to_dict(self, sink_name: str, now: float) -> dict[str, Any]:
@@ -139,6 +145,7 @@ class StatusTracker:
         device.reason = reason
         if phase == "buffering":
             device.buffering_at.append(now)
+            self._check_buffering_loop(sink_name, device, now)
         if phase in {"ready", "unavailable"}:
             device.player_state = None
             if device.buffering_timer is not None:
@@ -149,6 +156,34 @@ class StatusTracker:
         elif phase == "connecting":
             self._set_active(sink_name)
         self._changed()
+
+    def _check_buffering_loop(self, sink_name: str, device: _Device, now: float) -> None:
+        """Spot a device that keeps re-buffering although the stream is served fine.
+
+        Each spell (longer than the grace) ends before the watchdog fires, so nothing
+        else notices. A Chromecast in this state has only recovered after a power cycle.
+        """
+        while device.buffering_at and now - device.buffering_at[0] > _BUFFERING_WINDOW:
+            device.buffering_at.popleft()
+        count = len(device.buffering_at)
+        if count <= 1:
+            device.in_buffering_loop = False
+        elif count >= _BUFFERING_LOOP_COUNT and not device.in_buffering_loop:
+            device.in_buffering_loop = True
+            logger.warning(
+                "Buffering loop on %s: buffered %d times in %ds while segments are served; "
+                "the Chromecast seems stuck (a power cycle has fixed it before)",
+                sink_name,
+                count,
+                int(_BUFFERING_WINDOW),
+            )
+            self.event(
+                "warning",
+                "buffering_loop",
+                "The Chromecast keeps buffering: unplug it and plug it back in",
+                sink_name,
+                count=count,
+            )
 
     def set_busy(self, sink_name: str, running: str | None) -> None:
         """Another app plays on the device (its running status text), or None."""

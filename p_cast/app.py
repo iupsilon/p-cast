@@ -9,7 +9,6 @@ import socket
 import tempfile
 import time
 import typing
-from collections import deque
 from collections.abc import AsyncIterator, Callable, Coroutine
 from functools import partial
 from typing import override
@@ -63,9 +62,6 @@ _FFMPEG_STARTUP_DELAY = 0.5
 _STREAM_SUBSCRIBE_DELAY = 2
 _APP_QUIT_DELAY = 1.0
 _FFMPEG_RESTART_DELAY = 2  # seconds to wait before restarting a stream whose FFmpeg exited
-# A device that starts buffering this often within the window is in a buffering loop.
-_BUFFERING_LOOP_COUNT = 8
-_BUFFERING_LOOP_WINDOW = 60
 _BUFFERING_RECOVER_TIMEOUT = 6  # seconds of sustained BUFFERING before restarting stream (6 is minimum)
 # Seconds between reconnection attempts to a device whose connection was lost; the last
 # value repeats. mDNS does not re-announce a device that only dropped off for a moment
@@ -238,9 +234,6 @@ class BufferingWatchdog(MediaStatusListener):
         self._on_recover = on_recover
         self._active = True
         self._timer_task: asyncio.Task[None] | None = None
-        self._buffering_onsets: deque[float] = deque()
-        self._in_loop = False
-        self._was_buffering = False
 
     @override
     def new_media_status(self, status: MediaStatus) -> None:
@@ -256,42 +249,6 @@ class BufferingWatchdog(MediaStatusListener):
             self._loop.call_soon_threadsafe(self._start_timer)
         else:  # PAUSED, PLAYING, IDLE, UNKNOWN
             self._loop.call_soon_threadsafe(self._cancel_timer)
-        self._loop.call_soon_threadsafe(self._track_loop, status.player_state == "BUFFERING")
-
-    def _track_loop(self, buffering: bool) -> None:  # noqa: FBT001
-        """Spot a device that keeps re-buffering although the stream is served fine.
-
-        Each spell is shorter than the recovery timeout, so the watchdog never fires; a
-        Chromecast in this state has only ever recovered from a power cycle. Called on
-        the event loop.
-        """
-        if not self._active or buffering == self._was_buffering:
-            return
-        self._was_buffering = buffering
-        now = time.monotonic()
-        while self._buffering_onsets and now - self._buffering_onsets[0] > _BUFFERING_LOOP_WINDOW:
-            self._buffering_onsets.popleft()
-        if buffering:
-            self._buffering_onsets.append(now)
-            if not self._in_loop and len(self._buffering_onsets) >= _BUFFERING_LOOP_COUNT:
-                self._in_loop = True
-                logger.warning(
-                    "Buffering loop on %s: %d times in %ds while segments are served; "
-                    "the Chromecast seems stuck (a power cycle has fixed it before)",
-                    self._sink_name,
-                    len(self._buffering_onsets),
-                    _BUFFERING_LOOP_WINDOW,
-                )
-                tracker.event(
-                    "warning",
-                    "buffering_loop",
-                    "The Chromecast keeps buffering: unplug it and plug it back in",
-                    self._sink_name,
-                    count=len(self._buffering_onsets),
-                )
-        elif self._in_loop and len(self._buffering_onsets) <= 1:
-            self._in_loop = False
-            logger.info("Buffering loop on %s is over", self._sink_name)
 
     @override
     def load_media_failed(self, queue_item_id: int, error_code: int) -> None:
